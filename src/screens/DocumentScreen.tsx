@@ -5,26 +5,35 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity,
-  StatusBar, ActivityIndicator, Dimensions, Platform,
+  View, Text, StyleSheet, TouchableOpacity, Image,
+  StatusBar, ActivityIndicator, useWindowDimensions, Platform, NativeModules, PixelRatio,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useApp } from '../context/AppContext';
 
-let Pdf: any = null;
-try { Pdf = require('react-native-pdf').default; } catch (_) {}
+// FIX: was react-native-pdf, which wraps a third-party PDFium native
+// library (io.legere.pdfiumandroid / libpdfium.so) with a confirmed,
+// unpatched native crash (SIGSEGV — one page's close() racing another
+// page's render() on shared FreeType state). Replaced with a custom native
+// module (android/.../PdfPageModule.kt) built on Android's own PdfRenderer
+// API — part of the OS itself, not a bundled third-party library — which
+// renders each page to a plain image file instead.
+const { PdfPageModule } = NativeModules;
 let FileViewer: any = null;
 try { FileViewer = require('react-native-file-viewer').default; } catch (_) {}
 let RNFS: any = null;
 try { RNFS = require('react-native-fs'); } catch (_) {}
-let RNBlobUtil: any = null;
-try { RNBlobUtil = require('react-native-blob-util').default; } catch (_) {}
 
 import { TVFile, reportError, ENV } from '../services/api';
 
-const { width: W, height: H } = Dimensions.get('window');
-
-const isPdf = (n: string) => ['pdf','ppt','pptx'].includes((n||'').split('.').pop()?.toLowerCase() || '');
+// FIX: isPdf now only matches actual PDFs. It previously included ppt/pptx,
+// which were being handed straight to the PDFium-based <Pdf> renderer —
+// PDFium cannot parse PPT/PPTX (they're a completely different file format,
+// ZIP+XML vs PDF's own structure) and this was a plausible native crash
+// trigger on some devices. ppt/pptx/doc/docx/xls/xlsx now fall through to
+// the info-card branch below instead of ever reaching the PDF renderer.
+const isPdf = (n: string) => ((n||'').split('.').pop()?.toLowerCase() || '') === 'pdf';
+const isOfficeDoc = (n: string) => ['ppt','pptx','doc','docx','xls','xlsx'].includes((n||'').split('.').pop()?.toLowerCase() || '');
 const DURATION_KEY = (fileName: string) => `doc_dur_${fileName.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
 const DOC_COLORS: Record<string, string> = {
@@ -41,6 +50,13 @@ interface Props {
 export default function DocumentScreen({ navigation, route }: Props) {
   const { file, duration: routeDuration } = route.params;
   const { tv } = useApp();
+  // FIX: was `Dimensions.get('window')` read once at module load — if the
+  // screen's actual orientation/size wasn't settled yet at that instant
+  // (e.g. still portrait during startup, or a genuine rotation later), every
+  // size calculation below stayed locked to that stale value for the rest of
+  // the app's life. useWindowDimensions() stays live and updates on real
+  // orientation/size changes instead.
+  const { width: W, height: H } = useWindowDimensions();
 
   // FIX 2.2: load persisted per-page duration from AsyncStorage
   const serverDur   = routeDuration || (isPdf(file.file_name) ? ENV.PDF_DURATION : ENV.DOC_DURATION);
@@ -55,10 +71,31 @@ export default function DocumentScreen({ navigation, route }: Props) {
   const [localPath,     setLocalPath]     = useState<string | null>(null);
   const [pdfError,      setPdfError]      = useState(false);
   const [downloadPct,   setDownloadPct]   = useState(0);
+  // Each page is fit + zoomed to the screen box using ITS OWN actual
+  // dimensions natively (see PdfPageModule.kt) — not a size calibrated once
+  // from a different page — so pageBoxW/H below are just whatever the
+  // native render call reports back for the page currently on screen.
+  const [pageImageUri,   setPageImageUri]   = useState<string | null>(null);
+  const [pageBoxW,       setPageBoxW]       = useState<number | null>(null);
+  const [pageBoxH,       setPageBoxH]       = useState<number | null>(null);
 
   const timerRef   = useRef<any>(null);
   const countRef   = useRef<any>(null);
   const controlRef = useRef<any>(null);
+
+  // Short cooldown on manual Prev/Next taps purely to stop a double-tap
+  // from firing two overlapping page-render calls — not a crash-safety
+  // measure (PdfPageModule doesn't share the old library's race condition).
+  const pageNavLockRef = useRef(false);
+  const changePage = (next: number) => {
+    if (pageNavLockRef.current) return;
+    pageNavLockRef.current = true;
+    setTimeout(() => { pageNavLockRef.current = false; }, 400);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    if (countRef.current) clearInterval(countRef.current);
+    if (next > totalPages) { goBack(); return; }
+    setCurrentPage(Math.max(1, next));
+  };
 
   // Load saved duration override
   useEffect(() => {
@@ -120,7 +157,7 @@ export default function DocumentScreen({ navigation, route }: Props) {
       const exists = RNFS ? await RNFS.exists(file.local_path) : false;
       if (exists) { await openFile(file.local_path); return; }
     }
-    if (!RNBlobUtil && !RNFS) {
+    if (!RNFS) {
       setLoadingMsg('Cannot download — no file library');
       setLoading(false);
       startTimer(customDur);
@@ -128,34 +165,19 @@ export default function DocumentScreen({ navigation, route }: Props) {
     }
     try {
       setLoadingMsg('Downloading...');
-      const dir = RNFS
-        ? `${RNFS.DocumentDirectoryPath}/dms_docs`
-        : `${RNBlobUtil.fs.dirs.DocumentDir}/dms_docs`;
-      if (RNFS) {
-        if (!(await RNFS.exists(dir))) await RNFS.mkdir(dir);
-      } else {
-        if (!(await RNBlobUtil.fs.exists(dir))) await RNBlobUtil.fs.mkdir(dir);
-      }
+      const dir = `${RNFS.DocumentDirectoryPath}/dms_docs`;
+      if (!(await RNFS.exists(dir))) await RNFS.mkdir(dir);
       const safeName = file.file_name.replace(/[^a-zA-Z0-9._-]/g, '_');
       const destPath = `${dir}/${file.id}_${safeName}`;
-      const alreadyExists = RNFS ? await RNFS.exists(destPath) : await RNBlobUtil.fs.exists(destPath);
+      const alreadyExists = await RNFS.exists(destPath);
       if (!alreadyExists) {
-        if (RNFS) {
-          await RNFS.downloadFile({
-            fromUrl: file.file_url, toFile: destPath,
-            progress: (p: any) => {
-              const pct = Math.round((p.bytesWritten / p.contentLength) * 100);
-              setDownloadPct(pct); setLoadingMsg(`Downloading... ${pct}%`);
-            },
-          }).promise;
-        } else {
-          await RNBlobUtil.config({ path: destPath, fileCache: true })
-            .fetch('GET', file.file_url)
-            .progress((r: number, t: number) => {
-              const pct = Math.round((r / t) * 100);
-              setDownloadPct(pct); setLoadingMsg(`Downloading... ${pct}%`);
-            });
-        }
+        await RNFS.downloadFile({
+          fromUrl: file.file_url, toFile: destPath,
+          progress: (p: any) => {
+            const pct = Math.round((p.bytesWritten / p.contentLength) * 100);
+            setDownloadPct(pct); setLoadingMsg(`Downloading... ${pct}%`);
+          },
+        }).promise;
       }
       await openFile(destPath);
     } catch (e) {
@@ -188,6 +210,77 @@ export default function DocumentScreen({ navigation, route }: Props) {
     };
   }, [currentPage, loading, totalPages, pdfError, localPath, pageDur]);
 
+  // Opens the PDF once via PdfPageModule and reads its page count.
+  useEffect(() => {
+    if (!isPdf(file.file_name) || !localPath || !PdfPageModule) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const info = await PdfPageModule.openDocument(localPath);
+        if (cancelled) return;
+        setTotalPages(info.pageCount || 1);
+      } catch (e) {
+        if (cancelled) return;
+        setPdfError(true);
+        try {
+          const reason = (e as any)?.message || String(e);
+          if (tv) reportError({ tv_id:tv.tv_id, db_name:tv.db_name, error_type:'pdf_render', error_message:`PDF open failed: ${file.file_name} — ${reason}` }).catch(()=>{});
+        } catch(_) {}
+        setTimeout(() => goBack(), 3000);
+      }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localPath]);
+
+  // Renders the current page to an image file, fit + zoomed to the screen
+  // box using THIS page's own real dimensions (computed natively — see
+  // PdfPageModule.kt). Zoom trims blank page margins on all 4 edges evenly;
+  // 14% per request — 12% was crop-free, 15% just started clipping the top
+  // of tight-margin pages (e.g. page 2 of the Hardware JD doc), so 14% is
+  // being tried as the middle ground. Still a guess about how much margin a
+  // given page actually has, so it needs checking across real documents.
+  // Re-fires on page change and on W/H themselves changing (e.g. a real
+  // screen rotation/resize after a page was already rendered).
+  const PDF_ZOOM = 1.14;
+  useEffect(() => {
+    if (!isPdf(file.file_name) || !localPath || !PdfPageModule || pdfError) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        // W/H from useWindowDimensions() are density-independent px — the
+        // bitmap needs to be rendered at the screen's real (physical) pixel
+        // count or it comes out visibly blurry once stretched to fill that
+        // many dp on any screen with pixel density > 1. Render at physical
+        // pixels, then convert the returned size back to dp for layout.
+        const ratio = PixelRatio.get();
+        const res = await PdfPageModule.renderPage(localPath, currentPage - 1, W * ratio, H * ratio, PDF_ZOOM);
+        if (!cancelled) {
+          setPageImageUri(res.uri);
+          setPageBoxW(res.width / ratio);
+          setPageBoxH(res.height / ratio);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        setPdfError(true);
+        try {
+          const reason = (e as any)?.message || String(e);
+          if (tv) reportError({ tv_id:tv.tv_id, db_name:tv.db_name, error_type:'pdf_render', error_message:`PDF page render failed: ${file.file_name} p${currentPage} — ${reason}` }).catch(()=>{});
+        } catch(_) {}
+        setTimeout(() => goBack(), 3000);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentPage, localPath, pdfError, W, H]);
+
+  // Release the native renderer/file handle when leaving this document.
+  useEffect(() => () => {
+    if (PdfPageModule && isPdf(file.file_name)) {
+      try { PdfPageModule.closeDocument(); } catch (_) {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleTap = () => {
     setShowControls(true);
     if (controlRef.current) clearTimeout(controlRef.current);
@@ -208,33 +301,23 @@ export default function DocumentScreen({ navigation, route }: Props) {
   const durOptions = [15, 30, 50, 60, 90, 120, 180, 300];
 
   const renderContent = () => {
-    if (isPdf(file.file_name) && localPath && Pdf && !pdfError) {
+    if (isPdf(file.file_name) && localPath && PdfPageModule && !pdfError) {
+      // The image is already rendered natively at the correct fit+zoom size
+      // for THIS page (see the renderPage effect above and PdfPageModule.kt)
+      // — no further sizing math needed here. The wrapper is a fixed
+      // W x H box with overflow hidden, so the (slightly-larger-than-box,
+      // by PDF_ZOOM) centered image gets cropped evenly on all 4 edges.
       return (
-        <Pdf
-          source={{ uri: `file://${localPath}`, cache: true }}
-          enablePaging={true}
-          enableAntialiasing={false}
-          enableRTL={false}
-          minScale={1.0}
-          maxScale={1.0}
-          scale={1.0}
-          fitPolicy={0}
-          spacing={0}
-          renderActivityIndicator={() => <ActivityIndicator size="large" color="#0ABCAA"/>}
-          page={currentPage}
-          style={s.media}
-          onLoadComplete={(pages: number) => setTotalPages(pages)}
-          onPageChanged={(page: number) => setCurrentPage(page)}
-          onError={() => {
-            setPdfError(true);
-            try {
-              if (tv) reportError({ tv_id:tv.tv_id, db_name:tv.db_name, error_type:'pdf_render', error_message:`PDF render failed: ${file.file_name}` }).catch(()=>{});
-            } catch(_) {}
-            setTimeout(() => goBack(), 3000);
-          }}
-          enablePaging horizontal fitPolicy={0} trustAllCerts={false}
-          renderActivityIndicator={() => <ActivityIndicator size="large" color={color}/>}
-        />
+        <View style={[s.pdfStretchWrap, { width: W, height: H }]}>
+          {pageImageUri && pageBoxW && pageBoxH ? (
+            <Image
+              source={{ uri: `file://${pageImageUri}` }}
+              style={{ width: pageBoxW, height: pageBoxH }}
+            />
+          ) : (
+            <ActivityIndicator size="large" color={color}/>
+          )}
+        </View>
       );
     }
     return (
@@ -247,7 +330,10 @@ export default function DocumentScreen({ navigation, route }: Props) {
           <Text style={s.extPillTxt}>{ext}</Text>
         </View>
         <Text style={s.infoSub}>
-          {pdfError ? 'PDF render failed — skipping in 3s...' : !Pdf && isPdf(file.file_name) ? 'react-native-pdf not installed' : 'Opened in external viewer'}
+          {pdfError ? 'PDF render failed — skipping in 3s...'
+           : !PdfPageModule && isPdf(file.file_name) ? 'PDF renderer not available'
+           : isOfficeDoc(file.file_name) ? 'Not supported on this display — convert to PDF to show it here'
+           : 'Opened in external viewer'}
         </Text>
         <Text style={s.countdown}>{timeLeft}s</Text>
       </View>
@@ -300,7 +386,7 @@ export default function DocumentScreen({ navigation, route }: Props) {
             {isPdf(file.file_name) && totalPages > 1 ? (
               <>
                 <TouchableOpacity style={s.navBtn}
-                  onPress={() => { if(timerRef.current) clearTimeout(timerRef.current); if(countRef.current) clearInterval(countRef.current); setCurrentPage(p => Math.max(1, p - 1)); }}>
+                  onPress={() => changePage(currentPage - 1)}>
                   <Text style={s.navBtnTxt}>◀ Prev</Text>
                 </TouchableOpacity>
                 <View style={s.dotsRow}>
@@ -310,7 +396,7 @@ export default function DocumentScreen({ navigation, route }: Props) {
                   {totalPages > 10 && <Text style={s.moreTxt}>+{totalPages - 10}</Text>}
                 </View>
                 <TouchableOpacity style={[s.navBtn, { backgroundColor: color, borderColor: color }]}
-                  onPress={() => { if(timerRef.current) clearTimeout(timerRef.current); if(countRef.current) clearInterval(countRef.current); if (currentPage >= totalPages) goBack(); else setCurrentPage(p => p + 1); }}>
+                  onPress={() => changePage(currentPage + 1)}>
                   <Text style={[s.navBtnTxt, { color:'#fff' }]}>{currentPage >= totalPages ? 'Done ✓' : 'Next ▶'}</Text>
                 </TouchableOpacity>
               </>
@@ -356,7 +442,7 @@ export default function DocumentScreen({ navigation, route }: Props) {
 const s = StyleSheet.create({
   container:    { flex:1, backgroundColor:'#111' },
   content:      { flex:1 },
-  media:        { flex:1, width:W, height:H },
+  pdfStretchWrap: { alignItems:'center', justifyContent:'center', overflow:'hidden' },
   infoCard:     { flex:1, alignItems:'center', justifyContent:'center', padding:32 },
   infoIcon:     { fontSize:80, marginBottom:16 },
   infoName:     { fontSize:16, fontWeight:'700', color:'#fff', textAlign:'center', marginBottom:12 },

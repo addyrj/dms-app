@@ -58,7 +58,39 @@ npx react-native run-android --device 0412108R40003488
 
 
 
+4. app size is around 100 mb so it is so big why ????
+<!-- ------------------------- -->
 
+1.app crashing on pdf play  in tv it is working in mobile but in tv it is crashing ...
+
+
+2. remote is  working only on login page ,remote is not working in another page. like player scree or dashboard screen.in sync and play scrool is not working in side bar both ,  mouse is working but remote is not working.
+
+D-pad UP/DOWN moves navFocus index
+Each nav item highlights when focused
+Remote SELECT triggers that item
+No need to physically scroll — focus jumps
+Remote OK/Select → opens sidebar
+Remote UP/DOWN  → navigates sidebar items (highlight moves)
+Remote SELECT   → triggers highlighted nav item
+Remote BACK/MENU → closes sidebar or goes back
+Works on: PlayerScreen ✅
+// Not present in PlayerScreen or DashboardScreen:
+useTVEventHandler((evt) => {
+  if (evt.eventType === 'select') { /* open sidebar */ }
+  if (evt.eventType === 'right')  { /* next file */ }
+  if (evt.eventType === 'left')   { /* prev file */ }
+  if (evt.eventType === 'up')     { /* volume up */ }
+  if (evt.eventType === 'down')   { /* volume down */ }
+});
+
+hasTVPreferredFocus={true} → remote auto-focuses the first input on screen load
+isTVSelectable={true} → button is focusable by remote
+Native Android TV focus chain handles d-pad navigation automatically
+
+
+
+3.ppt /power point and excel / csv run in dipslay like pdf right now . check how it possibel in react native.....
 
 
 

@@ -13,15 +13,15 @@ const parseUrls = (raw: string): string[] =>
 
 export const ENV = {
   USE_LOCAL,
+  // No hardcoded fallback URLs — API_URLS comes entirely from .env
+  // (LOCAL_API_URL when USE_LOCAL=true, PROD_API_URL when USE_LOCAL=false).
+  // If it's empty, BASE_URLS is empty and tvLogin() reports that plainly.
   API_URLS: USE_LOCAL
-    ? (parseUrls(Config.LOCAL_API_URL || '').length > 0
-        ? parseUrls(Config.LOCAL_API_URL)
-        : ['http://localhost:5004', 'http://192.168.1.101:5004'])
-    : (parseUrls(Config.PROD_API_URL || '').length > 0
-        ? parseUrls(Config.PROD_API_URL)
-        : ['https://ispplsop.com']),  // fallback online URL
+    ? parseUrls(Config.LOCAL_API_URL || '')
+    : parseUrls(Config.PROD_API_URL || ''),
   MQTT_HOST: USE_LOCAL ? (Config.LOCAL_MQTT_HOST || '') : (Config.PROD_MQTT_HOST || ''),
   MQTT_PORT: USE_LOCAL ? Number(Config.LOCAL_MQTT_PORT || 9001) : Number(Config.PROD_MQTT_PORT || 9001),
+  MQTT_SSL:  USE_LOCAL ? false : true,
   MQTT_USER: USE_LOCAL ? (Config.LOCAL_MQTT_USER || '') : (Config.PROD_MQTT_USER || ''),
   MQTT_PASS: USE_LOCAL ? (Config.LOCAL_MQTT_PASS || '') : (Config.PROD_MQTT_PASS || ''),
   PDF_DURATION:   Number(Config.PDF_DURATION   || 50),
@@ -33,7 +33,7 @@ export const ENV = {
 console.log('[ENV] USE_LOCAL:', USE_LOCAL, '| Config.USE_LOCAL:', Config.USE_LOCAL);
 console.log('[ENV] PROD_API_URL:', Config.PROD_API_URL);
 console.log('[ENV] API_URLS:', JSON.stringify(ENV.API_URLS));
-console.log('[ENV] MQTT_HOST:', ENV.MQTT_HOST, 'PORT:', ENV.MQTT_PORT);
+console.log('[ENV] MQTT_HOST:', ENV.MQTT_HOST, 'PORT:', ENV.MQTT_PORT, 'SSL:', ENV.MQTT_SSL);
 
 export const BASE_URLS = ENV.API_URLS;
 let ACTIVE_URL = BASE_URLS[0] || '';
@@ -74,9 +74,20 @@ export interface TVAnnouncement {
   duration_minutes: number; expires_at: string; created_at: string;
 }
 
+export interface LoginError {
+  isNetwork: boolean;
+  message: string;
+  details?: string;
+}
+
 // Try each URL — first one that responds wins
 export const tvLogin = async (username: string, password: string, db_name: string): Promise<TVLoginResponse> => {
-  if (BASE_URLS.length === 0) throw 'No server URLs configured. Check your .env file.';
+  if (BASE_URLS.length === 0) {
+    throw {
+      isNetwork: true,
+      message: `No server address is configured for this build (${USE_LOCAL ? 'LOCAL_API_URL' : 'PROD_API_URL'} is empty in .env).`,
+    } as LoginError;
+  }
   for (const url of BASE_URLS) {
     try {
       const res = await axios.post(`${url}/api/tv/login`, { username, password, db_name },
@@ -86,11 +97,15 @@ export const tvLogin = async (username: string, password: string, db_name: strin
     } catch (e: any) {
       if (e.response) {
         ACTIVE_URL = url;
-        throw e.response.data?.error || `Login failed (${e.response.status})`;
+        throw { isNetwork:false, message: e.response.data?.error || `Login failed (${e.response.status})` } as LoginError;
       }
     }
   }
-  throw `Cannot connect to server. URLs tried: ${BASE_URLS.join(', ')}. Check your .env file.`;
+  throw {
+    isNetwork: true,
+    message: `Make sure this device is connected to the same WiFi network as your signage server, and that the server is running.`,
+    details: `Server address (from .env): ${BASE_URLS.join(', ')}`,
+  } as LoginError;
 };
 
 // Probe all URLs and set ACTIVE_URL to the first that responds

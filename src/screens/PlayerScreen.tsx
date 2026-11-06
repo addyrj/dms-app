@@ -12,7 +12,10 @@ import {
   View, Image, Text, StyleSheet, Dimensions,
   TouchableOpacity, StatusBar, ActivityIndicator,
   Animated, ScrollView, Platform, Modal, AppState,
+  BackHandler, UIManager, findNodeHandle, NativeModules, Alert,
 } from 'react-native';
+
+const { AutoStart } = NativeModules;
 
 import { useIsFocused } from '@react-navigation/native';
 import { useNavigation } from '@react-navigation/native';
@@ -448,9 +451,20 @@ export default function PlayerScreen({ navigation }: any) {
     mqttConnected, refreshFiles, logout,
     isSyncing, downloadProgress, volume,
     shouldSkipCurrent, clearSkipCurrent,
+    isPublishingContent, contentPublished,
   } = useApp();
 
   const isFocused = useIsFocused();
+
+  // Full black "Publishing" screen only for the first 5 s, then old content keeps
+  // playing with a slim progress bar on top (old files stay on disk until the swap)
+  const [publishCollapsed, setPublishCollapsed] = useState(false);
+  useEffect(() => {
+    setPublishCollapsed(false);
+    if (!isPublishingContent) return;
+    const t = setTimeout(() => setPublishCollapsed(true), 5000);
+    return () => clearTimeout(t);
+  }, [isPublishingContent]);
 
   const fileKey  = allFiles.map(f => `${f.id}:${f.file_name}`).join('|');
   // CHANGE: Include documents in the playlist loop
@@ -467,6 +481,39 @@ export default function PlayerScreen({ navigation }: any) {
   const [docModal,    setDocModal]    = useState(false);
   const [navFocus,    setNavFocus]    = useState(0);
   const slideAnim = useRef(new Animated.Value(-SIDEBAR_W)).current;
+
+  // FIX: hasTVPreferredFocus/isTVSelectable are not reliably honored by
+  // stock react-native on Android (isTVSelectable isn't even forwarded to
+  // the native view by TouchableOpacity — it's a no-op; hasTVPreferredFocus
+  // is primarily a tvOS behavior). Drive initial D-pad focus imperatively
+  // instead — once a view actually holds native focus, Android's own
+  // proximity-based focus engine correctly moves it with the D-pad from there.
+  //
+  // ref.current.focus() is a no-op here (host component refs don't expose
+  // it outside TextInput-style components). UIManager.focus(tag) only
+  // exists in full Bridgeless mode (global.RN$Bridgeless === true) — this
+  // app runs Fabric/New Architecture but not Bridgeless, so that threw
+  // "undefined is not a function" and crashed the app on launch. Using
+  // dispatchViewManagerCommand's 'focus' command instead, which is always
+  // present on UIManager (both Paper and Fabric) and is the command the
+  // base Android ReactViewManager has handled since RN 0.62 specifically
+  // for TV focus. Wrapped defensively — if this also isn't supported here,
+  // it must fail silently, never crash the app.
+  const hamburgerRef = useRef<any>(null);
+  const firstNavRef  = useRef<any>(null);
+  const focusRef = (ref: React.RefObject<any>) => {
+    try {
+      const tag = findNodeHandle(ref.current);
+      if (tag != null) UIManager.dispatchViewManagerCommand(tag, 'focus', []);
+    } catch (_) {}
+  };
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (sidebarOpen) focusRef(firstNavRef);
+      else focusRef(hamburgerRef);
+    }, 120);
+    return () => clearTimeout(t);
+  }, [sidebarOpen]);
 
   // Delete sync feedback state
   const [isDeleting, setIsDeleting] = useState(false);
@@ -509,6 +556,52 @@ export default function PlayerScreen({ navigation }: any) {
     }).start(() => setSidebarOpen(false));
   };
 
+  // ── Auto-start on TV power-on (native AutoStart module) ─────
+  const [autoStartOn, setAutoStartOn] = useState(true);
+  const refreshAutoStart = useCallback(() => {
+    AutoStart?.getState().then((st: any) => setAutoStartOn(!!st.enabled)).catch(() => {});
+  }, []);
+  useEffect(() => { if (isFocused) refreshAutoStart(); }, [isFocused, sidebarOpen]);
+
+  const exitToTv = () => {
+    if (AutoStart) AutoStart.exitToTv();
+    else BackHandler.exitApp();
+  };
+
+  const toggleAutoStart = () => {
+    const next = !autoStartOn;
+    AutoStart?.setEnabled(next);
+    setAutoStartOn(next);
+  };
+
+  // Remote BACK/MENU key closes the sidebar instead of falling through to
+  // React Navigation's default back behaviour (which would exit the screen).
+  // BackHandler is stock React Native and reliably receives the Android TV
+  // remote's back/menu key — unlike useTVEventHandler, whose 'select' /
+  // 'up' / 'down' / 'left' / 'right' event types need react-native-tvos for
+  // full Android D-pad coverage (this project currently uses plain
+  // react-native, not the -tvos fork).
+  // With the sidebar closed, Back (also mouse right-click) asks before leaving to the TV home.
+  // Only while this screen is focused, so Back on the Document screen keeps working.
+  useEffect(() => {
+    const onBack = () => {
+      if (!isFocused) return false;
+      if (sidebarOpen) { closeSidebar(); return true; }
+      Alert.alert(
+        'Exit to TV?',
+        'IotSopTv will open again automatically the next time the TV is switched on.',
+        [
+          { text: 'No', style: 'cancel' },
+          { text: 'Yes, exit', onPress: exitToTv },
+        ],
+        { cancelable: true },
+      );
+      return true;
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+    return () => sub.remove();
+  }, [sidebarOpen, isFocused]);
+
   // ── Nav handler — same logic as Dashboard ───────────────────
   const handleNav = (id: string) => {
     closeSidebar();
@@ -522,9 +615,18 @@ export default function PlayerScreen({ navigation }: any) {
         navigation.navigate('Sync');
         return;
       }
+      if (id === 'autostart') { toggleAutoStart(); return; }
+      if (id === 'exittv') { exitToTv(); return; }
       if (id === 'signout') { logout(); return; }
     }, 250);
   };
+
+  const navItems = [
+    ...NAV.slice(0, -1),
+    { id:'autostart', icon:'⚡', label:`Auto-start: ${autoStartOn ? 'ON' : 'OFF'}` },
+    { id:'exittv',    icon:'📺', label:'Exit to TV' },
+    NAV[NAV.length - 1],
+  ] as typeof NAV;
 
   // ── next ────────────────────────────────────────────────────
   const next = useCallback(() => {
@@ -648,9 +750,11 @@ export default function PlayerScreen({ navigation }: any) {
         
         {/* ── Hamburger button — top-left, always visible ── */}
         <TouchableOpacity
+          ref={hamburgerRef}
           style={s.hamburgerBtn}
           onPress={openSidebar}
           activeOpacity={0.8}
+          focusable={true}
           isTVSelectable={true}>
           <View style={s.hLine}/>
           <View style={[s.hLine, { width:14 }]}/>
@@ -670,11 +774,23 @@ export default function PlayerScreen({ navigation }: any) {
             style={s.overlay}
             activeOpacity={1}
             onPress={closeSidebar}
+            isTVSelectable={false}
+            focusable={false}
           />
         )}
 
-        {/* ── SIDEBAR ───────────────────────────── */}
-        <Animated.View style={[s.sidebar, { transform:[{ translateX: slideAnim }] }]}>
+        {/* ── SIDEBAR ─────────────────────────────
+            FIX: sidebar is positioned with left:0 permanently and only ever
+            moves via transform. Android's TV focus engine calculates position
+            from LAYOUT bounds, not the paint-time transform, so a closed
+            sidebar's buttons were still sitting in the focus tree at their
+            normal on-screen spot — reachable/colliding even while invisible.
+            pointerEvents + importantForAccessibility remove the whole subtree
+            from touch and focus when closed. ── */}
+        <Animated.View
+          style={[s.sidebar, { transform:[{ translateX: slideAnim }] }]}
+          pointerEvents={sidebarOpen ? 'auto' : 'none'}
+          importantForAccessibility={sidebarOpen ? 'yes' : 'no-hide-descendants'}>
           {/* Header: logo + TV pill */}
           <View style={s.sidebarHeader}>
             <Image
@@ -706,9 +822,10 @@ export default function PlayerScreen({ navigation }: any) {
             contentContainerStyle={s.navList}
             showsVerticalScrollIndicator={false}
             keyboardShouldPersistTaps="handled">
-            {NAV.map((item, i) => (
+            {navItems.map((item, i) => (
               <TouchableOpacity
                 key={item.id}
+                ref={i === 0 ? firstNavRef : undefined}
                 style={[
                   s.navItem,
                   item.danger && s.navItemDanger,
@@ -716,7 +833,10 @@ export default function PlayerScreen({ navigation }: any) {
                 ]}
                 onPress={() => handleNav(item.id)}
                 onFocus={() => setNavFocus(i)}
-                isTVSelectable={true}>
+                hasTVPreferredFocus={sidebarOpen && i === 0}
+                isTVSelectable={true}
+                focusable={sidebarOpen}
+                accessible={true}>
                 <Text style={[s.navIcon, item.danger && { color:'#EF4444' }]}>
                   {item.icon}
                 </Text>
@@ -824,9 +944,11 @@ export default function PlayerScreen({ navigation }: any) {
 
       {/* ── Hamburger button — top-left, always visible on mobile ── */}
       <TouchableOpacity
+        ref={hamburgerRef}
         style={s.hamburgerBtn}
         onPress={openSidebar}
         activeOpacity={0.8}
+        focusable={true}
         hasTVPreferredFocus={!sidebarOpen}
         isTVSelectable={true}>
         <View style={s.hLine}/>
@@ -850,14 +972,14 @@ export default function PlayerScreen({ navigation }: any) {
       )}
 
       {/* ── Download progress ────────────────────────────────── */}
-      {isSyncing && downloadProgress && (
+      {isSyncing && downloadProgress && !isPublishingContent && (
         <DownloadIndicator
           fileIndex={downloadProgress.fileIndex}
           filePct={downloadProgress.filePct}
           total={downloadProgress.total}
         />
       )}
-      {isSyncing && !downloadProgress && (
+      {isSyncing && !downloadProgress && !isPublishingContent && (
         <View style={s.dlWrap} pointerEvents="none">
           <ActivityIndicator size="small" color="#fff" style={{ marginRight:6 }}/>
           <Text style={s.dlLabel}>Syncing…</Text>
@@ -875,8 +997,14 @@ export default function PlayerScreen({ navigation }: any) {
         />
       )}
 
-      {/* ── SIDEBAR — identical to DashboardScreen ───────────── */}
-      <Animated.View style={[s.sidebar, { transform:[{ translateX: slideAnim }] }]}>
+      {/* ── SIDEBAR — identical to DashboardScreen ─────────────
+          FIX: see comment on the no-content sidebar above — gate the
+          subtree out of touch/focus when closed instead of relying on
+          transform alone, which Android's TV focus engine ignores. ── */}
+      <Animated.View
+        style={[s.sidebar, { transform:[{ translateX: slideAnim }] }]}
+        pointerEvents={sidebarOpen ? 'auto' : 'none'}
+        importantForAccessibility={sidebarOpen ? 'yes' : 'no-hide-descendants'}>
 
         {/* Header: logo + TV pill */}
         <View style={s.sidebarHeader}>
@@ -909,7 +1037,7 @@ export default function PlayerScreen({ navigation }: any) {
           contentContainerStyle={s.navList}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled">
-          {NAV.map((item, i) => (
+          {navItems.map((item, i) => (
             <TouchableOpacity
               key={item.id}
               style={[
@@ -921,7 +1049,7 @@ export default function PlayerScreen({ navigation }: any) {
               onFocus={() => setNavFocus(i)}
               hasTVPreferredFocus={sidebarOpen && i === 0}
               isTVSelectable={true}
-              focusable={true}
+              focusable={sidebarOpen}
               accessible={true}>
               <Text style={[s.navIcon, item.danger && { color:'#EF4444' }]}>
                 {item.icon}
@@ -955,7 +1083,54 @@ export default function PlayerScreen({ navigation }: any) {
         const utc = raw.endsWith('Z') ? raw : raw.replace(' ','T') + 'Z';
         return new Date(utc) > new Date();
       })() && (
-      <Ticker ann={announcement} onExpire={() => setAnnouncement(null)}/>  // ← must be LAST
+      <Ticker ann={announcement} onExpire={() => setAnnouncement(null)}/>
+      )}
+
+      {/* ── Full-screen publishing overlay ────────────────────── */}
+      {isPublishingContent && publishCollapsed && (
+        <View style={s.publishBar} pointerEvents="none">
+          <View style={s.publishBarRow}>
+            <ActivityIndicator size="small" color="#fff" style={{ marginRight:8 }}/>
+            <Text style={s.publishBarText} numberOfLines={1}>
+              Publishing new content…
+              {downloadProgress
+                ? `  file ${downloadProgress.fileIndex + 1} of ${downloadProgress.total} · ${Math.round(downloadProgress.filePct)}%`
+                : ''}
+            </Text>
+          </View>
+          <View style={s.publishBarTrack}>
+            <View style={[s.publishBarFill, {
+              width: `${downloadProgress ? Math.max(2, Math.round(downloadProgress.filePct)) : 2}%` as any,
+            }]}/>
+          </View>
+        </View>
+      )}
+
+      {isPublishingContent && !publishCollapsed && (
+        <View style={s.publishingOverlay}>
+          <ActivityIndicator size="large" color="#fff" style={{ marginBottom: 20 }} />
+          <Text style={s.publishingTitle}>Publishing New Content...</Text>
+          <Text style={s.publishingSub}>Please wait while new content is being prepared</Text>
+          {downloadProgress && (
+            <View style={{ width:'60%', alignItems:'center' }}>
+              <Text style={s.publishingFile}>
+                Downloading file {downloadProgress.fileIndex + 1} of {downloadProgress.total}
+              </Text>
+              <View style={[s.publishingTrack, { alignSelf:'stretch' }]}>
+                <View style={[s.publishingFill, { width: `${Math.round(downloadProgress.filePct)}%` as any }]} />
+              </View>
+              <Text style={s.publishingPct}>{Math.round(downloadProgress.filePct)}%</Text>
+            </View>
+          )}
+        </View>
+      )}
+
+      {/* ── Green "Published" banner ──────────────────────────── */}
+      {contentPublished && (
+        <View style={s.publishedBanner}>
+          <Text style={s.publishedIcon}>✓</Text>
+          <Text style={s.publishedText}>New Content Published!</Text>
+        </View>
       )}
     </View>
   );
@@ -1095,4 +1270,28 @@ const s = StyleSheet.create({
   openBtn:   { paddingHorizontal:12, paddingVertical:8, borderRadius:10,
                alignItems:'center', marginLeft:8, minWidth:52 },
   openBtnTxt:{ color:'#fff', fontSize:12, fontWeight:'700', textAlign:'center' },
+
+  publishingOverlay: { position:'absolute', top:0, left:0, right:0, bottom:0,
+                       backgroundColor:'rgba(0,0,0,0.92)',
+                       alignItems:'center', justifyContent:'center', zIndex:200 },
+  publishingTitle:   { color:'#fff', fontSize:28, fontWeight:'800', marginBottom:8 },
+  publishingSub:     { color:'#9CA3AF', fontSize:16, marginBottom:32 },
+  publishingFile:    { color:'#60A5FA', fontSize:14, fontWeight:'700', marginBottom:12 },
+  publishingTrack:   { height:8, backgroundColor:'rgba(255,255,255,0.2)',
+                       borderRadius:4, overflow:'hidden' },
+  publishingFill:    { height:8, backgroundColor:'#60A5FA', borderRadius:4 },
+  publishingPct:     { color:'#fff', fontSize:18, fontWeight:'800', marginTop:12 },
+  publishBar:        { position:'absolute', top:10, alignSelf:'center', zIndex:60,
+                       minWidth:320, maxWidth:'60%', paddingHorizontal:14, paddingVertical:8,
+                       backgroundColor:'rgba(0,0,0,0.78)', borderRadius:12,
+                       borderWidth:1, borderColor:'rgba(96,165,250,0.6)' },
+  publishBarRow:     { flexDirection:'row', alignItems:'center', marginBottom:6 },
+  publishBarText:    { color:'#fff', fontSize:14, fontWeight:'700', flexShrink:1 },
+  publishBarTrack:   { height:5, backgroundColor:'rgba(255,255,255,0.2)', borderRadius:3, overflow:'hidden' },
+  publishBarFill:    { height:5, backgroundColor:'#60A5FA', borderRadius:3 },
+  publishedBanner:   { position:'absolute', top:0, left:0, right:0, bottom:0,
+                       backgroundColor:'rgba(22,163,74,0.95)',
+                       alignItems:'center', justifyContent:'center', zIndex:200 },
+  publishedIcon:     { color:'#fff', fontSize:64, fontWeight:'800', marginBottom:16 },
+  publishedText:     { color:'#fff', fontSize:32, fontWeight:'800' },
 });

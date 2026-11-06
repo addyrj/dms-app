@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  This is a signage app that talks to a server on the local network over
+  plain http:// / ws:// (no TLS) — the server address is whatever LOCAL_API_URL
+  in .env points to, which can be any local IP, so it can't be scoped to a
+  fixed domain. Release builds block cleartext traffic by default (Android 9+);
+  this explicitly allows it, matching how debug builds already behave.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

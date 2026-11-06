@@ -1,10 +1,11 @@
 // src/screens/SyncScreen.tsx
 // Updated to use context.syncNow() (real download) and show per-file progress
 // from context.downloadProgress instead of faked HEAD checks.
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   ScrollView, ActivityIndicator, StatusBar,
+  UIManager, findNodeHandle,
 } from 'react-native';
 import { useApp } from '../context/AppContext';
 import { getTvFiles, reportError, TVFile } from '../services/api';
@@ -16,6 +17,26 @@ export default function SyncScreen({ navigation }: any) {
   const [statuses, setStatuses] = useState<FileStatus[]>([]);
   const [phase,    setPhase]    = useState<'idle'|'loading'|'downloading'|'done'|'error'>('idle');
   const [log,      setLog]      = useState<string[]>([]);
+  const [focusedRow, setFocusedRow] = useState(0);
+
+  // FIX: hasTVPreferredFocus isn't reliably honored on stock RN Android.
+  // ref.current.focus() is a no-op, and UIManager.focus() only exists in
+  // full Bridgeless mode (crashed the app when called here — this project
+  // runs Fabric but not Bridgeless). dispatchViewManagerCommand's 'focus'
+  // command is always present and is what the base Android ReactViewManager
+  // handles for TV focus. Wrapped defensively so a failure here can never
+  // crash the app, only leave D-pad focus unset.
+  const firstRowRef = useRef<any>(null);
+  useEffect(() => {
+    if (statuses.length === 0) return;
+    const t = setTimeout(() => {
+      try {
+        const tag = findNodeHandle(firstRowRef.current);
+        if (tag != null) UIManager.dispatchViewManagerCommand(tag, 'focus', []);
+      } catch (_) {}
+    }, 120);
+    return () => clearTimeout(t);
+  }, [statuses.length > 0]);
 
   const addLog = (msg: string) => setLog(p => [...p, `${new Date().toLocaleTimeString()} — ${msg}`]);
 
@@ -91,8 +112,16 @@ export default function SyncScreen({ navigation }: any) {
       </View>
 
       <ScrollView contentContainerStyle={s.scroll}>
-        {statuses.map(item => (
-          <View key={item.file.id} style={s.row}>
+        {statuses.map((item, i) => (
+          <TouchableOpacity
+            key={item.file.id}
+            ref={i === 0 ? firstRowRef : undefined}
+            style={[s.row, focusedRow === i && s.rowFocused]}
+            onFocus={() => setFocusedRow(i)}
+            hasTVPreferredFocus={i === 0}
+            isTVSelectable={true}
+            focusable={true}
+            activeOpacity={1}>
             <Text style={s.rowIcon}>{stateIcon(item.state)}</Text>
             <View style={{flex:1}}>
               <Text style={s.rowName} numberOfLines={1}>{item.file.file_name}</Text>
@@ -104,7 +133,7 @@ export default function SyncScreen({ navigation }: any) {
               </View>
             )}
             {item.state==='done' && <View style={s.rowBadge}><Text style={s.rowBadgeText}>OK</Text></View>}
-          </View>
+          </TouchableOpacity>
         ))}
         <View style={s.logBox}>
           <Text style={s.logTitle}>LOG</Text>
@@ -146,6 +175,7 @@ const s = StyleSheet.create({
   bannerText:   { fontSize:13, fontWeight:'600', flex:1 },
   scroll:       { padding:16, paddingBottom:160 },
   row:          { flexDirection:'row', alignItems:'center', backgroundColor:'#fff', borderRadius:12, padding:14, marginBottom:8, borderWidth:1, borderColor:'#E5E7EB' },
+  rowFocused:   { borderColor:'#0ABCAA', borderWidth:2 },
   rowIcon:      { fontSize:20, marginRight:12 },
   rowName:      { fontSize:14, fontWeight:'600', color:'#1A1A2E', marginBottom:3 },
   rowNote:      { fontSize:12, color:'#6B7280' },

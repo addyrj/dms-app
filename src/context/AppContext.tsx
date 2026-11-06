@@ -9,7 +9,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MqttService } from '../services/MqttService';
-import { syncLocalFiles, loadLocalPlaylist } from '../services/StorageService';
+import { syncLocalFiles, loadLocalPlaylist, cleanOldFilesFromDisk } from '../services/StorageService';
 import {
   TVLoginResponse, TVFile,
   sendHeartbeat, getTvFiles, reportStorage,
@@ -45,7 +45,9 @@ interface AppState {
   isSyncing:        boolean;
   downloadProgress: DownloadProgress | null;
   lastSyncTime:     Date | null;
-  volume:           number;
+  volume:              number;
+  isPublishingContent: boolean;
+  contentPublished:    boolean;
 }
 
 interface AppContextValue extends AppState {
@@ -77,6 +79,8 @@ export function AppProvider({ children, onLogout }: {
   const [lastSyncTime,     setLastSyncTime]     = useState<Date | null>(null);
   const [shouldSkipCurrent,setShouldSkipCurrent] = useState(false);
   const [volume,           setVolume]           = useState<number>(50);
+  const [isPublishingContent, setIsPublishingContent] = useState(false);
+  const [contentPublished,    setContentPublished]    = useState(false);
 
   const heartbeatRef  = useRef<ReturnType<typeof setInterval> | null>(null);
   const storageRef    = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -158,6 +162,16 @@ export function AppProvider({ children, onLogout }: {
       console.log('[Sync] Fetching file list...');
       const serverFiles = await getTvFiles(cur.tv_id, cur.db_name);
       console.log(`[Sync] ${serverFiles.length} file(s) from server`);
+
+      const currentIds = new Set(filesRef.current.map((f: TVFile) => f.id));
+      const serverIds = new Set(serverFiles.map((f: TVFile) => f.id));
+      const fullChange = currentIds.size > 0 && serverIds.size > 0 &&
+        ![...serverIds].some(id => currentIds.has(id));
+      if (fullChange) {
+        console.log('[Sync] Full content change detected — publishing overlay');
+        setIsPublishingContent(true);
+      }
+
       const downloaded = await syncLocalFiles(
         serverFiles,
         (fileIndex, filePct, total) => setDownloadProgress({ fileIndex, filePct, total })
@@ -167,13 +181,19 @@ export function AppProvider({ children, onLogout }: {
         await reportDownloadComplete(cur.tv_id, cur.db_name, 0);
         MqttService.publishCompleted();
       }
-      setPendingFiles(downloaded);
+
+      if (fullChange && downloaded.length > 0) {
+        setFiles(downloaded);
+        setPendingFiles(null);
+        await cleanOldFilesFromDisk(downloaded);
+        setIsPublishingContent(false);
+        setContentPublished(true);
+        setTimeout(() => setContentPublished(false), 4000);
+      } else {
+        setPendingFiles(downloaded);
+      }
       setLastSyncTime(new Date());
 
-      // FIX: Auto-play when new content arrives (not just on boot)
-      // Only triggers if files actually changed (prevents forcing back to Player on periodic sync)
-      // Use ref for current files (avoids stale closure)
-      const currentIds = new Set(filesRef.current.map((f: TVFile) => f.id));
       const hasNewFiles = downloaded.length !== filesRef.current.length ||
         downloaded.some((f: TVFile) => !currentIds.has(f.id));
       if (downloaded.length > 0 && hasNewFiles) {
@@ -182,6 +202,7 @@ export function AppProvider({ children, onLogout }: {
       }
     } catch (e) {
       console.warn('[Sync] Failed — keeping current playlist:', e);
+      setIsPublishingContent(false);
       const local = await loadLocalPlaylist();
       if (local.length > 0 && files.length === 0) setFiles(local);
     } finally {
@@ -196,6 +217,7 @@ export function AppProvider({ children, onLogout }: {
       if (prev !== null) {
         console.log(`[AppContext] Swapping playlist → ${prev.length} files`);
         setFiles(prev);
+        cleanOldFilesFromDisk(prev).catch(() => {});
       }
       return null;
     });
@@ -262,7 +284,7 @@ export function AppProvider({ children, onLogout }: {
       tv, files, pendingFiles, mqttConnected, isLoggedIn,
       shouldAutoPlay, isSyncing, downloadProgress, lastSyncTime,
       login, logout, refreshFiles, syncNow, consumePending, setFiles, clearAutoPlay, clearSkipCurrent, setVolume,
-      volume, shouldSkipCurrent,
+      volume, shouldSkipCurrent, isPublishingContent, contentPublished,
     }}>
       {children}
     </AppContext.Provider>

@@ -3,10 +3,10 @@ import React, { useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   ActivityIndicator, ScrollView, KeyboardAvoidingView,
-  Platform, Alert, Image,
+  Platform, Image,
 } from 'react-native';
 import { useApp } from '../context/AppContext';
-import { tvLogin, BASE_URLS } from '../services/api';
+import { tvLogin, LoginError } from '../services/api';
 
 export default function LoginScreen() {
   const { login } = useApp();
@@ -17,6 +17,7 @@ export default function LoginScreen() {
   const [showDbField,   setShowDbField]   = useState(false); // hidden by default
   const [loading,       setLoading]       = useState(false);
   const [errors,        setErrors]        = useState({ display:'', password:'', db:'' });
+  const [loginError,    setLoginError]    = useState<LoginError | null>(null);
 
   const validate = () => {
     const e = { display:'', password:'', db:'' };
@@ -31,16 +32,23 @@ export default function LoginScreen() {
   const handleLogin = async () => {
     if (!validate()) return;
     setLoading(true);
+    setLoginError(null);
     try {
       const username = `display_${displayNumber.trim()}`;
       // If DB not provided, backend will auto-detect from display username
       const db = dbName.trim() || '';
       const result = await tvLogin(username, password, db);
-      if (!result.success) { Alert.alert('Login Failed', 'Invalid credentials.'); return; }
+      if (!result.success) {
+        setLoginError({ isNetwork:false, message:'Invalid display username or password.' });
+        return;
+      }
       await login(result);
     } catch (err: any) {
-      const msg = typeof err === 'string' ? err : 'Cannot connect to server.';
-      Alert.alert('Login Failed', msg);
+      if (err && typeof err === 'object' && 'message' in err) {
+        setLoginError(err as LoginError);
+      } else {
+        setLoginError({ isNetwork:false, message: typeof err === 'string' ? err : 'Something went wrong. Please try again.' });
+      }
     } finally { setLoading(false); }
   };
 
@@ -99,10 +107,27 @@ export default function LoginScreen() {
             </TouchableOpacity>
           </View>
           {errors.password ? <Text style={s.errText}>{errors.password}</Text> : null}
+
+          {loginError && (
+            <View style={[s.errorCard, loginError.isNetwork ? s.errorCardNetwork : s.errorCardAuth]}>
+              <View style={s.errorHeader}>
+                <Text style={s.errorIcon}>{loginError.isNetwork ? '📡' : '🔒'}</Text>
+                <Text style={s.errorTitle}>
+                  {loginError.isNetwork ? "Can't Reach Server" : 'Sign In Failed'}
+                </Text>
+              </View>
+              <Text style={s.errorMessage}>{loginError.message}</Text>
+              {loginError.details && (
+                <Text style={s.errorDetailsText}>{loginError.details}</Text>
+              )}
+            </View>
+          )}
+
           <TouchableOpacity
             style={[s.loginBtn, loading && s.loginBtnDim]}
             onPress={handleLogin}
             disabled={loading}
+            focusable={true}
             isTVSelectable={true}>
             {loading
               ? <ActivityIndicator color="#fff"/>
@@ -164,6 +189,15 @@ const s = StyleSheet.create({
                   borderWidth:1, borderColor:'#BBF7D0' },
   infoText:     { fontSize:12, color:'#6B7280', lineHeight:18 },
   infoCode:     { color:'#16A34A', fontWeight:'700' },
+  errorCard:    { borderRadius:14, padding:16, marginTop:14, marginBottom:4, borderWidth:1 },
+  errorCardNetwork: { backgroundColor:'#FFFBEB', borderColor:'#FDE68A' },
+  errorCardAuth:    { backgroundColor:'#FEF2F2', borderColor:'#FECACA' },
+  errorHeader:  { flexDirection:'row', alignItems:'center', marginBottom:6 },
+  errorIcon:    { fontSize:20, marginRight:8 },
+  errorTitle:   { fontSize:15, fontWeight:'700', color:'#1A1A2E' },
+  errorMessage: { fontSize:13, color:'#4B5563', lineHeight:19 },
+  errorDetailsText:   { fontSize:12, color:'#4B5563', marginTop:10, lineHeight:17, fontWeight:'600',
+                        backgroundColor:'rgba(0,0,0,0.04)', borderRadius:8, padding:10 },
   loginBtn:     { backgroundColor:'#16A34A', borderRadius:12, paddingVertical:15,
                   alignItems:'center', marginTop:4,
                   shadowColor:'#16A34A', shadowOffset:{width:0,height:4},

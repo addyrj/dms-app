@@ -9,13 +9,8 @@ type CommandListener       = (command: MqttCommand) => void;
 type StatusListener        = (connected: boolean) => void;
 type AnnouncementListener  = (announcement: any) => void;
 
-const FALLBACK_IPS = ENV.USE_LOCAL
-  ?
-  //  ['192.168.1.101', '192.168.1.102', '192.168.1.103', '192.168.1.100']
-      ['https://ispplsop.com']
-
-  : []; // no local fallbacks in online mode
-
+// No hardcoded fallback hosts — MQTT host comes entirely from .env
+// (LOCAL_MQTT_HOST, or the hostname parsed out of LOCAL_API_URL/PROD_API_URL).
 const getMqttHosts = (): string[] => {
   const hosts = new Set<string>();
   if (ENV.MQTT_HOST && ENV.MQTT_HOST.trim()) hosts.add(ENV.MQTT_HOST.trim());
@@ -24,10 +19,6 @@ const getMqttHosts = (): string[] => {
       const match = url.match(/https?:\/\/([^:/]+)/);
       if (match && match[1]) hosts.add(match[1]);
     } catch (_) {}
-  }
-  if (hosts.size === 0) {
-    console.warn('[MQTT] ENV empty — using fallback IPs');
-    FALLBACK_IPS.forEach(ip => hosts.add(ip));
   }
   return Array.from(hosts).filter(h => h.length > 0);
 };
@@ -79,7 +70,8 @@ class MqttServiceClass {
         return;
       }
 
-      console.log(`[MQTT] Connecting → ws://${host}:${port}/mqtt`);
+      // console.log(`[MQTT] Connecting → ws://${host}:${port}/mqtt`);
+        console.log(`[MQTT] Connecting → wss://${host}:${port}/mqtt`);
       this.client = new Paho.Client(host, Number(port), '/mqtt', clientId);
 
       this.client.onConnectionLost = (res: any) => {
@@ -131,7 +123,9 @@ class MqttServiceClass {
         keepAliveInterval: 60,
         cleanSession: false,
         timeout: 8,
-        useSSL: false,
+        // useSSL: false,
+          // useSSL: true,
+                  useSSL: ENV.MQTT_SSL,
         willMessage: willMsg,
         onSuccess: () => {
           console.log(`[MQTT] Connected ✅ → ${host}:${port}`);

@@ -118,12 +118,11 @@ export const syncLocalFiles = async (
   }
 
   console.log(`[Storage] ${playable.length}/${serverFiles.length} files playable`);
-  await cleanOldFiles(playable);
   await savePlaylist(playable);
   return playable;
 };
 
-const cleanOldFiles = async (currentFiles: TVFile[]) => {
+export const cleanOldFilesFromDisk = async (currentFiles: TVFile[]) => {
   // FIX 6: Also remove files deleted from server (not in current server list)
   if (!RNFS) return;
   try {
